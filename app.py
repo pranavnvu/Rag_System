@@ -33,6 +33,13 @@ class VectorStoreManager:
             metadata={"description": "Vector store collection for PDF embeddings in RAG", "hnsw:space": "cosine"}
         )
         
+    def reset_store(self):
+        try:
+            self.client.delete_collection(name=self.collection_name)
+        except Exception:
+            pass
+        self.initialize_store()
+
     def add_documents(self, documents, embeddings):
         if not documents: return
         ids = [f"doc_{uuid.uuid4()}" for _ in documents]
@@ -59,29 +66,53 @@ class RAGRetriever:
         self.emb_manager = emb_manager
         self.vector_store = vector_store
 
-    def retrieve(self, query, top_k=5, score_threshold=0.0):
+    def retrieve(self, query, top_k=5, score_threshold=-1.0):
+        total_count = self.vector_store.collection.count()
+        if total_count == 0:
+            return []
+            
+        # Over-sample to eliminate duplicates and apply hybrid ranking
+        n_candidates = min(max(top_k * 4, 10), total_count)
         query_embedding = self.emb_manager.generate_embeddings([query])[0]
         results = self.vector_store.collection.query(
             query_embeddings=[query_embedding.tolist()],
-            n_results=top_k
+            n_results=n_candidates
         )
-        retrieved_docs = []
+        
+        import re
+        query_terms = set(w.lower() for w in re.findall(r"\w+", query) if len(w) > 3)
+        
+        unique_docs = {}
         if results["documents"] and results["documents"][0]:
             ids = results["ids"][0]
             metadatas = results["metadatas"][0]
             documents = results["documents"][0]
             distances = results["distances"][0]
-            for i, (doc_id, metadata, document, distance) in enumerate(zip(ids, metadatas, documents, distances)):
-                similarity_score = 1 - distance
-                if similarity_score >= score_threshold:
-                    retrieved_docs.append({
+            for doc_id, metadata, document, distance in zip(ids, metadatas, documents, distances):
+                cleaned = document.strip()
+                if cleaned not in unique_docs:
+                    similarity_score = 1 - distance
+                    doc_lower = cleaned.lower()
+                    kw_matches = sum(1 for term in query_terms if term in doc_lower)
+                    hybrid_score = similarity_score + (0.12 * kw_matches)
+                    
+                    unique_docs[cleaned] = {
                         "id": doc_id,
                         "document": document,
                         "metadata": metadata,
                         "distance": distance,
                         "similarity_score": similarity_score,
-                        "rank": i + 1
-                    })
+                        "hybrid_score": hybrid_score
+                    }
+                    
+        # Sort by hybrid score
+        ranked = sorted(unique_docs.values(), key=lambda x: x["hybrid_score"], reverse=True)
+        retrieved_docs = []
+        for i, item in enumerate(ranked[:top_k]):
+            if item["similarity_score"] >= score_threshold:
+                item["rank"] = i + 1
+                retrieved_docs.append(item)
+                
         return retrieved_docs
 
 # Streamlit App
@@ -134,10 +165,18 @@ st.sidebar.title("Configuration ⚙️")
 st.sidebar.info("Connected to local Ollama (model: qwen3:8b)")
 llm = ChatOllama(model="qwen3:8b", temperature=0.1, max_tokens=1024)
 
-top_k = st.sidebar.slider("Top-K Documents to Retrieve", min_value=1, max_value=10, value=3)
+top_k = st.sidebar.slider("Top-K Documents to Retrieve", min_value=1, max_value=10, value=5)
+
+st.sidebar.divider()
+st.sidebar.subheader("Vector Database 🗄️")
+if st.sidebar.button("🗑️ Clear Vector Database"):
+    vector_store.reset_store()
+    st.sidebar.success("Database cleared!")
+    st.rerun()
 
 st.sidebar.divider()
 st.sidebar.subheader("Add new PDF")
+replace_existing = st.sidebar.checkbox("Replace existing documents", value=True, help="Wipes previous chunks before adding new document to prevent duplicate results")
 uploaded_file = st.sidebar.file_uploader("Upload a PDF to the Vector Store", type=["pdf"])
 if uploaded_file is not None:
     if st.sidebar.button("Process PDF"):
@@ -147,12 +186,15 @@ if uploaded_file is not None:
                 tmp_path = tmp_file.name
                 
             try:
+                if replace_existing:
+                    vector_store.reset_store()
+
                 # Load PDF
                 loader = PyPDFLoader(tmp_path)
                 docs = loader.load()
                 
-                # Chunk PDF
-                text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+                # Chunk PDF (1000 chars keeps entire project descriptions and sections cohesive)
+                text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
                 chunks = text_splitter.split_documents(docs)
                 
                 # Embed chunks
@@ -161,7 +203,7 @@ if uploaded_file is not None:
                 
                 # Add to vector store
                 vector_store.add_documents(chunks, embeddings)
-                st.sidebar.success(f"Added {len(chunks)} chunks to the database!")
+                st.sidebar.success(f"Added {len(chunks)} cohesive chunks to the database!")
             except Exception as e:
                 st.sidebar.error(f"Error processing PDF: {e}")
             finally:
@@ -200,11 +242,17 @@ if query:
                     
                     if context_text:
                         # Construct Prompt
-                        prompt = f"""Use the given context to answer the query.
+                        prompt = f"""You are an intelligent, precise AI assistant. Answer the user question accurately and thoroughly based ONLY on the provided context below.
+
 Context: 
 {context_text}
 
-Query: {query}
+User Question: {query}
+
+Instructions:
+- If the user asks for names, projects, experience, skills, or lists, extract and enumerate all of them clearly from the context.
+- Be direct, factual, and complete.
+
 Answer:"""
                         # Generate response
                         response = llm.invoke(prompt)
