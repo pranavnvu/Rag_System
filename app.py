@@ -86,6 +86,35 @@ class RAGRetriever:
 
 # Streamlit App
 st.set_page_config(page_title="Interactive RAG UI", layout="wide")
+
+# Hide Deploy button and all menu items except the mode/theme switcher
+st.markdown("""
+<style>
+/* Hide Deploy button */
+.stDeployButton,
+[data-testid="stToolbarActions"],
+[data-testid="stDeployButton"] {
+    display: none !important;
+}
+
+/* Inside the 3-dots menu: keep ONLY the theme/mode switcher buttons */
+[data-testid="stMainMenuList"] > :not([data-testid="stThemeSwitcher"]) {
+    display: none !important;
+}
+
+/* Hide menu dividers */
+[data-testid="stMainMenuDivider"],
+[data-testid="stMainMenuList"] [role="separator"] {
+    display: none !important;
+}
+
+/* Hide version info and footer */
+[data-testid="stMainMenuList"] ~ * {
+    display: none !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 st.title("Interactive RAG Assistant 📚")
 st.write("Ask questions based on your embedded PDFs in the `data/vector_store` directory.")
 
